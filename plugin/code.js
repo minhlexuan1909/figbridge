@@ -883,7 +883,6 @@ async function handleCommand(cmdId, action, args) {
       return { ok: true, pageCount: pageResults.length, pages: pageResults };
     }
     if (action === "agent-bundle") {
-      if (typeof FrameshiftAgent === "undefined") return { ok: false, error: "agent bundle module not loaded" };
       var roots;
       if (args && args.nodeId) {
         var n = await figma.getNodeByIdAsync(args.nodeId);
@@ -896,7 +895,7 @@ async function handleCommand(cmdId, action, args) {
         });
       }
       if (!roots.length) return { ok: false, error: "no frames to export" };
-      var files = await FrameshiftAgent.computeAgentBundle(roots, {
+      var files = await computeAgentBundle(roots, {
         budget: (args && args.budget) || "medium",
         screenshots: !!(args && args.screenshots),
         codePaths: (args && args.codePaths) || [],
@@ -940,8 +939,7 @@ figma.ui.onmessage = async function (msg) {
       if (_liveBridge) onSelectionChange();
       break;
     case "export-agent":
-      if (typeof FrameshiftAgent !== "undefined") await FrameshiftAgent.exportAgentBundle(msg);
-      else figma.ui.postMessage({ type: "error", message: "Agent bundle module not loaded." });
+      await exportAgentBundle(msg);
       break;
     case "close": figma.closePlugin(); break;
   }
@@ -949,13 +947,11 @@ figma.ui.onmessage = async function (msg) {
 
 // ============================================================
 // FRAMESHIFT AGENT BUNDLE (ported from figma2code)
-// Self-contained IIFE — no name collisions with Figbridge code above.
-// Exposes: FrameshiftAgent.exportAgentBundle(msg)
+// Top-level helpers — formerly wrapped in a `FrameshiftAgent` IIFE,
+// unwrapped so the router above can actually see them. QuickJS
+// function-scopes everything inside an IIFE.
 // ============================================================
 // ── Page map ──────────────────────────────────────────────────
-// (Formerly wrapped in a `FrameshiftAgent` IIFE — unwrapped so that
-// top-of-file event handlers can actually see these helpers. The IIFE
-// scope was the real root cause of every "X is not defined" error.)
 function sendPageMap() {
   var pages = figma.root.children.map(function (page) {
     return {
@@ -3294,38 +3290,38 @@ async function exportAgentBundle(msg) {
 }
 
 
-  async function computeAgentBundle(roots, opts) {
-    opts = opts || {};
-    resetCSS("css");
-    resetMainCompCache();
-    setVariableMap(await loadVariables());
-    setAssetCache(await prefetchAssets(roots));
-    setTextStyleMap(await loadTextStyles(roots));
-    await prefetchMainComponents(roots);
-    var slugLock = {};
-    var priorSnapshot = null;
-    if (figma.clientStorage) {
-      try { slugLock = (await figma.clientStorage.getAsync("frameshift:slugLock")) || {}; } catch (e) {}
-      try { priorSnapshot = (await figma.clientStorage.getAsync("frameshift:snapshot")) || null; } catch (e) {}
-    }
-    setSlugLock(slugLock);
-    var screenshots = null;
-    if (opts.screenshots) {
-      screenshots = {};
-      for (var i = 0; i < roots.length; i++) {
-        try { screenshots[roots[i].id] = await roots[i].exportAsync({ format: "PNG", constraint: { type: "SCALE", value: 1 } }); } catch (e) {}
-      }
-    }
-    var files = buildAgentBundle(roots, figma.currentPage.name, {
-      budget: opts.budget || "medium",
-      screenshots: screenshots,
-      codePaths: opts.codePaths || [],
-      priorSnapshot: priorSnapshot,
-    });
-    if (figma.clientStorage) {
-      try { await figma.clientStorage.setAsync("frameshift:slugLock", getSlugLock()); } catch (e) {}
-      var snapFile = files.find(function (f) { return f.path === "snapshot.json"; });
-      if (snapFile) { try { await figma.clientStorage.setAsync("frameshift:snapshot", JSON.parse(snapFile.data)); } catch (e) {} }
-    }
-    return files;
+async function computeAgentBundle(roots, opts) {
+  opts = opts || {};
+  resetCSS("css");
+  resetMainCompCache();
+  setVariableMap(await loadVariables());
+  setAssetCache(await prefetchAssets(roots));
+  setTextStyleMap(await loadTextStyles(roots));
+  await prefetchMainComponents(roots);
+  var slugLock = {};
+  var priorSnapshot = null;
+  if (figma.clientStorage) {
+    try { slugLock = (await figma.clientStorage.getAsync("frameshift:slugLock")) || {}; } catch (e) {}
+    try { priorSnapshot = (await figma.clientStorage.getAsync("frameshift:snapshot")) || null; } catch (e) {}
   }
+  setSlugLock(slugLock);
+  var screenshots = null;
+  if (opts.screenshots) {
+    screenshots = {};
+    for (var i = 0; i < roots.length; i++) {
+      try { screenshots[roots[i].id] = await roots[i].exportAsync({ format: "PNG", constraint: { type: "SCALE", value: 1 } }); } catch (e) {}
+    }
+  }
+  var files = buildAgentBundle(roots, figma.currentPage.name, {
+    budget: opts.budget || "medium",
+    screenshots: screenshots,
+    codePaths: opts.codePaths || [],
+    priorSnapshot: priorSnapshot,
+  });
+  if (figma.clientStorage) {
+    try { await figma.clientStorage.setAsync("frameshift:slugLock", getSlugLock()); } catch (e) {}
+    var snapFile = files.find(function (f) { return f.path === "snapshot.json"; });
+    if (snapFile) { try { await figma.clientStorage.setAsync("frameshift:snapshot", JSON.parse(snapFile.data)); } catch (e) {} }
+  }
+  return files;
+}

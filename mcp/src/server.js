@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   getLatest as latestMem,
@@ -12,6 +14,10 @@ import {
 import { startBridge, createAttachedBridgeClient, sendCommand as localSendCommand, clientCount as localClientCount } from "./bridge.js";
 
 const FORMATS = ["html", "css", "tailwind", "tokens", "cssVars", "tailwindConfig", "all"];
+
+const PKG_VERSION = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
+).version;
 
 function log(...args) { process.stderr.write("[figbridge] " + args.join(" ") + "\n"); }
 
@@ -98,7 +104,7 @@ export async function main() {
   process.on("SIGINT",  () => shutdown("SIGINT"));
   process.on("SIGHUP",  () => shutdown("SIGHUP"));
 
-  const server = new McpServer({ name: "figbridge", version: "0.1.0" });
+  const server = new McpServer({ name: "figbridge", version: PKG_VERSION });
 
   server.tool(
     "get_current_selection",
