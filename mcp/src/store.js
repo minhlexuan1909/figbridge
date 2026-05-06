@@ -58,4 +58,25 @@ export function getHistorySince(sinceMs) {
   const t = Number(sinceMs) || 0;
   return history.filter((e) => (e.capturedAt || 0) > t);
 }
+
+/** Re-read persisted snapshot — used when this MCP attaches to another process's bridge. */
+export function readLatestFromDisk() {
+  try {
+    if (fs.existsSync(STORE_FILE)) return JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
+  } catch {}
+  return null;
+}
+
+export function readHistoryFromDisk() {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) return JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
+  } catch {}
+  return [];
+}
+
+export function readHistorySinceFromDisk(sinceMs) {
+  const t = Number(sinceMs) || 0;
+  return readHistoryFromDisk().filter((e) => (e.capturedAt || 0) > t);
+}
+
 export function clear() { latest = null; history = []; try { fs.rmSync(STORE_FILE, { force: true }); fs.rmSync(HISTORY_FILE, { force: true }); } catch {} }

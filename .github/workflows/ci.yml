@@ -42,6 +42,9 @@ jobs:
       - name: MCP smoke test
         run: node test/smoke.mjs
 
+      - name: MCP attach-to-shared-bridge
+        run: node test/attach-bridge.mjs
+
       - name: Render pipeline unit tests
         run: node test-agent/run.js
 

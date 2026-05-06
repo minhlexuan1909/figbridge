@@ -1,6 +1,6 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { setLatest, getLatest } from "./store.js";
+import { setLatest, getLatest, getHistory, getHistorySince } from "./store.js";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -50,7 +50,56 @@ export function clientCount() { return clients.size; }
 // older instance is still holding 7331, so a hard fatal there means
 // the user sees "Server disconnected" with no useful recovery. With
 // fallback, the new instance just picks 7332 and the plugin (which
-// probes the range) finds it. Resolves to `{ server, port }`.
+// probes the range) finds it. Resolves to `{ server, port, attached?: true }`.
+
+const BRIDGE_HEALTH_NAME = "figbridge-bridge";
+
+export async function probeFigbridgeListening(port, host = "127.0.0.1") {
+  try {
+    const r = await fetch(`http://${host}:${port}/health`);
+    if (!r.ok) return false;
+    const j = await r.json();
+    return j && j.ok === true && j.name === BRIDGE_HEALTH_NAME;
+  } catch {
+    return false;
+  }
+}
+
+/** HTTP delegate for MCP processes attached to another instance's bridge. */
+export function createAttachedBridgeClient(port, _log = () => {}, host = "127.0.0.1") {
+  const base = `http://${host}:${port}`;
+  async function postCommand(action, args, timeoutMs = 5000) {
+    const ac = globalThis.AbortSignal && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(timeoutMs + 2000)
+      : undefined;
+    const r = await fetch(`${base}/agent/command`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, args, timeoutMs }),
+      signal: ac
+    });
+    if (!r.ok) throw new Error(`bridge returned HTTP ${r.status}`);
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "agent command failed");
+    return j.result;
+  }
+  async function fetchClientCount() {
+    try {
+      const r = await fetch(`${base}/health`);
+      if (!r.ok) return 0;
+      const j = await r.json();
+      return typeof j.clients === "number" ? j.clients : 0;
+    } catch {
+      return 0;
+    }
+  }
+  return {
+    sendCommand: postCommand,
+    fetchClientCount,
+    bridgeBaseUrl: base
+  };
+}
+
 export function startBridge(preferredPort = 7331, log = () => {}, portRange = 9) {
   const server = http.createServer((req, res) => {
     if (req.method === "OPTIONS") { res.writeHead(204, CORS_HEADERS); return res.end(); }
@@ -58,12 +107,43 @@ export function startBridge(preferredPort = 7331, log = () => {}, portRange = 9)
     if (req.method === "GET" && req.url === "/health") {
       return send(res, 200, {
         ok: true, name: "figbridge-bridge",
-        hasLatest: !!getLatest(), clients: clients.size
+        hasLatest: !!getLatest(), clients: clients.size,
+        rpc: ["agent/command"]
       });
     }
 
     if (req.method === "GET" && req.url === "/latest") {
       return send(res, 200, getLatest() || { empty: true });
+    }
+
+    if (req.method === "GET" && req.url === "/history") {
+      return send(res, 200, { history: getHistory() });
+    }
+
+    if (req.method === "GET" && req.url.startsWith("/history-since")) {
+      const qs = req.url.includes("?") ? new URLSearchParams(req.url.slice(req.url.indexOf("?"))) : new URLSearchParams();
+      const sinceMs = qs.get("since") || qs.get("sinceMs") || "0";
+      return send(res, 200, { entries: getHistorySince(Number(sinceMs) || 0) });
+    }
+
+    // MCP sibling process forwards plugin commands via this route (canonical bridge owns the plugin SSE socket).
+    if (req.method === "POST" && req.url === "/agent/command") {
+      let chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", async () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+          const { action, args, timeoutMs } = body;
+          if (!action) return send(res, 400, { ok: false, error: "missing action" });
+          const tout = typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : 5000;
+          const result = await sendCommand(action, args || {}, tout);
+          return send(res, 200, { ok: true, result });
+        } catch (e) {
+          return send(res, 200, { ok: false, error: e && e.message ? e.message : String(e) });
+        }
+      });
+      req.on("error", () => {});
+      return;
     }
 
     // SSE — plugin subscribes here
@@ -135,13 +215,30 @@ export function startBridge(preferredPort = 7331, log = () => {}, portRange = 9)
     let settled = false;
     const onError = (e) => {
       if (settled) return;
-      if (e && e.code === "EADDRINUSE" && attempt < portRange) {
-        const stale = preferredPort + attempt;
-        attempt++;
-        const next = preferredPort + attempt;
-        log(`port ${stale} in use, trying ${next}`);
-        // server is still usable; re-listen on the next port
-        setImmediate(() => { if (!settled) server.listen(next, "127.0.0.1"); });
+      if (e && e.code === "EADDRINUSE") {
+        const triedPort = preferredPort + attempt;
+        void (async () => {
+          if (settled) return;
+          if (await probeFigbridgeListening(triedPort)) {
+            settled = true;
+            server.removeListener("error", onError);
+            try { server.close(); } catch {}
+            log(`port ${triedPort} already has figbridge; attaching MCP to it (HTTP commands only)`);
+            resolve({ server: null, port: triedPort, attached: true });
+            return;
+          }
+          if (settled) return;
+          if (attempt < portRange) {
+            attempt++;
+            const next = preferredPort + attempt;
+            log(`port ${triedPort} in use, trying ${next}`);
+            setImmediate(() => { if (!settled) server.listen(next, "127.0.0.1"); });
+            return;
+          }
+          settled = true;
+          server.removeListener("error", onError);
+          reject(e);
+        })();
         return;
       }
       settled = true;
@@ -155,7 +252,7 @@ export function startBridge(preferredPort = 7331, log = () => {}, portRange = 9)
       const addr = server.address();
       const port = addr && typeof addr === "object" ? addr.port : preferredPort + attempt;
       log(`bridge listening on http://127.0.0.1:${port}`);
-      resolve({ server, port });
+      resolve({ server, port, attached: false });
     });
     server.listen(preferredPort, "127.0.0.1");
   });

@@ -775,6 +775,18 @@
     })(i);
   }
   var eventSource = null;
+  // When the MCP/bridge process exits (e.g. Cursor closed), the first re-probe
+  // often runs before the new bridge is listening — without a follow-up timer
+  // we stayed stuck with pluginConnected: false until Live bridge was toggled.
+  var bridgeReconnectTimer = null;
+
+  function clearBridgeReconnectTimer() {
+    if (bridgeReconnectTimer) {
+      clearTimeout(bridgeReconnectTimer);
+      bridgeReconnectTimer = null;
+    }
+  }
+
   var el = function (id) { return document.getElementById(id); };
   var state = { tab: "html", data: null, bridge: false, view: "output" };
 
@@ -1461,8 +1473,21 @@
   }
   function openEventStream() {
     if (eventSource) return;
+    clearBridgeReconnectTimer();
     probeBridgePort(function(found){
-      if (!found) { setStatus("err", "Bridge offline"); setFoot("No bridge on " + PORT_BASE + "–" + (PORT_BASE + PORT_RANGE - 1)); return; }
+      if (!found) {
+        setStatus("err", "Bridge offline");
+        var rangeEnd = PORT_BASE + PORT_RANGE - 1;
+        setFoot("No bridge on " + PORT_BASE + "–" + rangeEnd + (state.bridge ? " — retrying…" : ""));
+        if (state.bridge) {
+          bridgeReconnectTimer = setTimeout(function () {
+            bridgeReconnectTimer = null;
+            openEventStream();
+          }, 2000);
+        }
+        return;
+      }
+      clearBridgeReconnectTimer();
       updatePortLabel();
       _openEventStreamInner();
     });
@@ -1487,9 +1512,20 @@
         eventSource = null;
         if (state.bridge) setTimeout(openEventStream, 800);
       };
-    } catch (e) { setFoot("EventSource error: " + e.message); }
+    } catch (e) {
+      setFoot("EventSource error: " + e.message);
+      if (state.bridge) {
+        bridgeReconnectTimer = setTimeout(function () {
+          bridgeReconnectTimer = null;
+          openEventStream();
+        }, 2000);
+      }
+    }
   }
-  function closeEventStream() { if (eventSource) { try { eventSource.close(); } catch (e) {}; eventSource = null; } }
+  function closeEventStream() {
+    clearBridgeReconnectTimer();
+    if (eventSource) { try { eventSource.close(); } catch (e) {}; eventSource = null; }
+  }
   function postCmdResult(cmdId, body) {
     return fetch(bridgeBase() + "/command/" + cmdId + "/result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(function () {});
   }

@@ -1,8 +1,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { getLatest, getHistory, getHistorySince } from "./store.js";
-import { startBridge, sendCommand, clientCount } from "./bridge.js";
+import {
+  getLatest as latestMem,
+  getHistory as historyMem,
+  getHistorySince as historySinceMem,
+  readLatestFromDisk,
+  readHistoryFromDisk,
+  readHistorySinceFromDisk
+} from "./store.js";
+import { startBridge, createAttachedBridgeClient, sendCommand as localSendCommand, clientCount as localClientCount } from "./bridge.js";
 
 const FORMATS = ["html", "css", "tailwind", "tokens", "cssVars", "tailwindConfig", "all"];
 
@@ -42,7 +49,24 @@ function asText(obj) {
 
 export async function main() {
   const preferredPort = Number(process.env.FIGBRIDGE_PORT || 7331);
-  const { server: bridgeServer, port } = await startBridge(preferredPort, log);
+  // If FIGBRIDGE_PORT is set (e.g. in Cursor mcp.json), bind exactly that port.
+  // Otherwise keep 7331..7340 fallback for orphan processes still holding :7331.
+  const explicitPreferredPort = process.env.FIGBRIDGE_PORT !== undefined && process.env.FIGBRIDGE_PORT !== "";
+  const portFallbackAttempts = explicitPreferredPort ? 0 : 9;
+  const { server: bridgeServer, port, attached } = await startBridge(preferredPort, log, portFallbackAttempts);
+
+  /** When attaching, selection/history reads come from ~/.figbridge (written by canonical bridge); commands tunnel over HTTP to that bridge. */
+  const snapshotLatest = attached ? () => readLatestFromDisk() : () => latestMem();
+  const snapshotHistory = attached ? () => readHistoryFromDisk() : () => historyMem();
+  const snapshotHistorySince = attached ? (ms) => readHistorySinceFromDisk(ms) : (ms) => historySinceMem(ms);
+  let invokeCommand = localSendCommand;
+  let bridgeClientLabel = "";
+  if (attached) {
+    const ac = createAttachedBridgeClient(port, log);
+    invokeCommand = ac.sendCommand;
+    bridgeClientLabel = ` (attached to existing bridge)`;
+    log(`MCP shares selection store + Live bridge via ${ac.bridgeBaseUrl}`);
+  }
 
   // ── Clean shutdown ──────────────────────────────────────────
   // Claude Desktop closes our stdin when it wants us to exit. If we
@@ -54,15 +78,17 @@ export async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`shutting down: ${reason}`);
-    try {
-      // SSE keepalive sockets hold the server open. close() alone waits
-      // for them to drain — which never happens. closeAllConnections()
-      // (Node 18.2+) severs idle + active sockets so close() resolves.
-      if (typeof bridgeServer.closeAllConnections === "function") {
-        bridgeServer.closeAllConnections();
-      }
-      bridgeServer.close();
-    } catch {}
+    if (bridgeServer) {
+      try {
+        // SSE keepalive sockets hold the server open. close() alone waits
+        // for them to drain — which never happens. closeAllConnections()
+        // (Node 18.2+) severs idle + active sockets so close() resolves.
+        if (typeof bridgeServer.closeAllConnections === "function") {
+          bridgeServer.closeAllConnections();
+        }
+        bridgeServer.close();
+      } catch {}
+    }
     // Hard-exit fallback in case something still holds the loop open.
     setTimeout(() => process.exit(0), 200).unref();
   }
@@ -80,21 +106,21 @@ export async function main() {
     {
       format: z.enum(FORMATS).optional().describe("Output format. Default: 'all' (metadata + every format). Use 'html' / 'css' / 'tailwind' / 'tokens' / 'cssVars' / 'tailwindConfig' for a single format.")
     },
-    async ({ format }) => asText(formatPayload(getLatest(), format || "all"))
+    async ({ format }) => asText(formatPayload(snapshotLatest(), format || "all"))
   );
 
   server.tool(
     "get_last_export",
     "Alias for get_current_selection. Returns the last pushed Figbridge payload.",
     { format: z.enum(FORMATS).optional() },
-    async ({ format }) => asText(formatPayload(getLatest(), format || "all"))
+    async ({ format }) => asText(formatPayload(snapshotLatest(), format || "all"))
   );
 
   server.tool(
     "list_history",
     "List recent Figma selections that have been pushed (metadata only, newest first).",
     {},
-    async () => asText({ history: getHistory() })
+    async () => asText({ history: snapshotHistory() })
   );
 
   server.tool(
@@ -102,7 +128,7 @@ export async function main() {
     "Get only the design-token payload (color + number variables, plus CSS variable file and Tailwind config).",
     {},
     async () => {
-      const p = getLatest();
+      const p = snapshotLatest();
       if (!p) return asText({ error: "No selection pushed yet." });
       return asText({ tokens: p.tokens, cssVars: p.cssVars, tailwindConfig: p.tailwindConfig });
     }
@@ -113,11 +139,21 @@ export async function main() {
     "Health check for the Figbridge HTTP bridge and the stored payload. Also reports whether a plugin is currently connected (pluginConnected).",
     {},
     async () => {
-      const p = getLatest();
+      const p = snapshotLatest();
+      let connectedClients = localClientCount();
+      if (attached) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${port}/health`);
+          if (r.ok) {
+            const j = await r.json();
+            if (typeof j.clients === "number") connectedClients = j.clients;
+          }
+        } catch {}
+      }
       return asText({
-        bridge: { port, running: true },
-        pluginConnected: clientCount() > 0,
-        connectedClients: clientCount(),
+        bridge: { port, running: attached ? "(remote)" : true, attached: !!attached },
+        pluginConnected: connectedClients > 0,
+        connectedClients,
         hasLatest: !!p,
         latest: p ? { pageName: p.pageName, nodeNames: p.nodeNames, capturedAt: p.capturedAt, fingerprint: p._fingerprint } : null
       });
@@ -135,7 +171,7 @@ export async function main() {
     async ({ nodeId, name }) => {
       if (!nodeId && !name) return asText({ error: "Provide nodeId or name." });
       try {
-        const result = await sendCommand("select", { nodeId, name });
+        const result = await invokeCommand("select", { nodeId, name });
         return asText({ ok: true, selected: result.selected || null });
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -150,11 +186,11 @@ export async function main() {
     },
     async ({ nodeId, format }) => {
       try {
-        await sendCommand("export-node", { nodeId }, 10000);
+        await invokeCommand("export-node", { nodeId }, 10000);
         // The plugin, after executing, POSTs to /push — which updates store.
         // Give it a moment to land.
         await new Promise((r) => setTimeout(r, 250));
-        return asText(formatPayload(getLatest(), format || "all"));
+        return asText(formatPayload(snapshotLatest(), format || "all"));
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
   );
@@ -168,7 +204,7 @@ export async function main() {
     },
     async ({ pageId }) => {
       try {
-        const result = await sendCommand("list-screens", { pageId }, 10000);
+        const result = await invokeCommand("list-screens", { pageId }, 10000);
         return asText({ count: result.count, screens: result.screens });
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -182,7 +218,7 @@ export async function main() {
     },
     async ({ includeVariants }) => {
       try {
-        const result = await sendCommand("list-components", { includeVariants: !!includeVariants }, 10000);
+        const result = await invokeCommand("list-components", { includeVariants: !!includeVariants }, 10000);
         return asText({ count: result.count, components: result.components });
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -194,7 +230,7 @@ export async function main() {
     { nodeId: z.string().describe("Figma node id of the screen/frame.") },
     async ({ nodeId }) => {
       try {
-        const result = await sendCommand("describe-screen", { nodeId }, 10000);
+        const result = await invokeCommand("describe-screen", { nodeId }, 10000);
         return asText(result);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -206,7 +242,7 @@ export async function main() {
     {},
     async () => {
       try {
-        const result = await sendCommand("export-app-spec", {}, 20000);
+        const result = await invokeCommand("export-app-spec", {}, 20000);
         return asText(result.spec);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -223,7 +259,7 @@ export async function main() {
     },
     async ({ sourceNodeId, name, textReplacements }) => {
       try {
-        const r = await sendCommand("clone-screen", { sourceNodeId, name, textReplacements }, 15000);
+        const r = await invokeCommand("clone-screen", { sourceNodeId, name, textReplacements }, 15000);
         return asText(r);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -239,7 +275,7 @@ export async function main() {
     },
     async ({ scope, nodeId, mapping }) => {
       try {
-        const r = await sendCommand("recolor", { scope, nodeId, mapping }, 15000);
+        const r = await invokeCommand("recolor", { scope, nodeId, mapping }, 15000);
         return asText(r);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -253,7 +289,7 @@ export async function main() {
     },
     async ({ nodeId }) => {
       try {
-        const r = await sendCommand("apply-tokens", { nodeId }, 15000);
+        const r = await invokeCommand("apply-tokens", { nodeId }, 15000);
         return asText(r);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -268,7 +304,7 @@ export async function main() {
     },
     async ({ kind, limit }) => {
       try {
-        const r = await sendCommand("list-assets", { kind, limit }, 30000);
+        const r = await invokeCommand("list-assets", { kind, limit }, 30000);
         return asText(r);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -282,7 +318,7 @@ export async function main() {
     },
     async ({ pageId }) => {
       try {
-        const r = await sendCommand("lint-ds", { pageId }, 20000);
+        const r = await invokeCommand("lint-ds", { pageId }, 20000);
         return asText(r);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -300,7 +336,7 @@ export async function main() {
     },
     async ({ nodeId, budget, screenshots, codePaths }) => {
       try {
-        const r = await sendCommand("agent-bundle", { nodeId, budget, screenshots, codePaths }, 60000);
+        const r = await invokeCommand("agent-bundle", { nodeId, budget, screenshots, codePaths }, 60000);
         return asText(r);
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -313,7 +349,7 @@ export async function main() {
     {},
     async () => {
       try {
-        const r = await sendCommand("list-pages", {}, 5000);
+        const r = await invokeCommand("list-pages", {}, 5000);
         return asText({ count: r.count, pages: r.pages });
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -325,7 +361,7 @@ export async function main() {
     { pageId: z.string().optional().describe("Page id. Omit to use the current page.") },
     async ({ pageId }) => {
       try {
-        const r = await sendCommand("list-frames", { pageId }, 5000);
+        const r = await invokeCommand("list-frames", { pageId }, 5000);
         return asText({ pageId: r.pageId, pageName: r.pageName, count: r.count, frames: r.frames });
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -337,7 +373,7 @@ export async function main() {
     {},
     async () => {
       try {
-        const r = await sendCommand("export-all", {}, 60000);
+        const r = await invokeCommand("export-all", {}, 60000);
         return asText({ pageCount: r.pageCount, pages: r.pages });
       } catch (e) { return asText({ ok: false, error: e.message }); }
     }
@@ -348,12 +384,12 @@ export async function main() {
     "diff_since",
     "Return history entries captured after the given timestamp (milliseconds since epoch). Each entry includes a 12-char SHA-1 fingerprint of the payload so you can detect real content changes vs re-selections.",
     { sinceMs: z.number().describe("Return entries with capturedAt > sinceMs. Use 0 for full history.") },
-    async ({ sinceMs }) => asText({ since: sinceMs, entries: getHistorySince(sinceMs) })
+    async ({ sinceMs }) => asText({ since: sinceMs, entries: snapshotHistorySince(sinceMs) })
   );
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`figbridge-mcp ready (stdio + bridge on :${port})`);
+  log(`figbridge-mcp ready (stdio + bridge on :${port}${bridgeClientLabel})`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -18,7 +18,7 @@
       "environmentVariables": [
         {
           "name": "FIGBRIDGE_PORT",
-          "description": "Preferred TCP port for the local HTTP+SSE bridge that the Figma plugin connects to. Defaults to 7331. If the port is in use, the bridge walks 7331..7340 automatically.",
+          "description": "Preferred TCP port for the local HTTP+SSE bridge the Figma plugin connects to (default 7331). If unset and the port is busy, the bridge tries 7332–7340. If the port is already held by another figbridge-mcp, this process attaches to it (shared bridge) instead of taking the next port — set the same value in every MCP client (Cursor, Codex, Claude) so they all use one Live bridge.",
           "isRequired": false,
           "isSecret": false,
           "format": "string"
